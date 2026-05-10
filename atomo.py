@@ -9,6 +9,19 @@ import sys
 import os
 from typing import List, Optional, Tuple
 
+# Key code constants
+CTRL_X = 24
+CTRL_O = 15
+CTRL_W = 23
+CTRL_K = 11
+CTRL_U = 21
+CTRL_G = 7
+CTRL_A = 1
+CTRL_E = 5
+CTRL_Z = 26
+
+MAX_UNDO = 200
+
 
 class AtomoEditor:
     """Main editor class that handles the text editing interface"""
@@ -19,13 +32,14 @@ class AtomoEditor:
         self.lines: List[str] = []
         self.cursor_y = 0
         self.cursor_x = 0
-        self.offset_y = 0  # Scroll offset for vertical scrolling
-        self.offset_x = 0  # Scroll offset for horizontal scrolling
+        self.offset_y = 0
+        self.offset_x = 0
         self.modified = False
         self.message = ""
-        self.message_type = "info"  # info, error, success
+        self.message_type = "info"
+        self.cut_buffer = ""
+        self.undo_stack: List[Tuple[List[str], int, int]] = []
 
-        # Initialize colors
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Status bar
@@ -33,15 +47,39 @@ class AtomoEditor:
         curses.init_pair(3, curses.COLOR_RED, -1)                    # Error
         curses.init_pair(4, curses.COLOR_GREEN, -1)                  # Success
 
-        # Configure curses
-        curses.curs_set(1)  # Show cursor
+        curses.curs_set(1)
         self.stdscr.keypad(True)
 
-        # Load file if specified
         if filename:
             self.load_file(filename)
         else:
             self.lines = [""]
+
+    # ------------------------------------------------------------------
+    # Undo
+    # ------------------------------------------------------------------
+
+    def push_undo(self):
+        """Save current state to undo stack before a destructive operation"""
+        self.undo_stack.append((list(self.lines), self.cursor_y, self.cursor_x))
+        if len(self.undo_stack) > MAX_UNDO:
+            self.undo_stack.pop(0)
+
+    def undo(self):
+        """Restore the previous state from the undo stack"""
+        if not self.undo_stack:
+            self.message = "Nothing to undo"
+            self.message_type = "info"
+            return
+        self.lines, self.cursor_y, self.cursor_x = self.undo_stack.pop()
+        self.modified = True
+        self.message = "Undo"
+        self.message_type = "info"
+        self.adjust_scroll()
+
+    # ------------------------------------------------------------------
+    # File I/O
+    # ------------------------------------------------------------------
 
     def load_file(self, filename: str) -> bool:
         """Load a file into the editor"""
@@ -76,9 +114,7 @@ class AtomoEditor:
 
         try:
             with open(self.filename, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(self.lines))
-                if self.lines and self.lines[-1]:  # Add final newline if last line has content
-                    f.write('\n')
+                f.write('\n'.join(self.lines) + '\n')
 
             self.modified = False
             self.message = f'Wrote {len(self.lines)} lines to {self.filename}'
@@ -89,19 +125,21 @@ class AtomoEditor:
             self.message_type = "error"
             return False
 
+    # ------------------------------------------------------------------
+    # Drawing
+    # ------------------------------------------------------------------
+
     def get_dimensions(self) -> Tuple[int, int]:
         """Get usable dimensions (excluding status bars)"""
         max_y, max_x = self.stdscr.getmaxyx()
-        # Reserve 2 lines for title and 2 lines for status/help
         return max_y - 4, max_x
 
     def safe_addstr(self, y, x, text, attr=0):
-        """Safely add string to screen with error handling"""
+        """Safely add string to screen, silently truncating at the right edge"""
         max_y, max_x = self.stdscr.getmaxyx()
         if y >= max_y or x >= max_x:
             return
 
-        # Truncate text to fit
         max_len = max_x - x - 1
         if max_len <= 0:
             return
@@ -114,22 +152,19 @@ class AtomoEditor:
             else:
                 self.stdscr.addstr(y, x, text)
         except curses.error:
-            pass  # Ignore curses errors (usually at screen edge)
+            pass
 
     def draw_title_bar(self):
         """Draw the top title bar"""
         max_y, max_x = self.stdscr.getmaxyx()
         title = "  GNU nano clone - Atomo"
         filename_display = self.filename if self.filename else "[New Buffer]"
-
-        # Modified indicator
         mod_indicator = " *" if self.modified else ""
 
         self.stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
         self.safe_addstr(0, 0, " " * (max_x - 1))
         self.safe_addstr(0, 0, title)
 
-        # Show filename in the center
         filename_str = f" File: {filename_display}{mod_indicator} "
         if len(filename_str) < max_x - len(title):
             x_pos = (max_x - len(filename_str)) // 2
@@ -140,8 +175,6 @@ class AtomoEditor:
     def draw_status_bar(self):
         """Draw the bottom status bar"""
         max_y, max_x = self.stdscr.getmaxyx()
-
-        # Line and column info
         status_left = f" Line {self.cursor_y + 1}/{len(self.lines)}  Col {self.cursor_x + 1} "
 
         self.stdscr.attron(curses.color_pair(1))
@@ -154,8 +187,8 @@ class AtomoEditor:
         max_y, max_x = self.stdscr.getmaxyx()
 
         shortcuts = [
-            ("^X", "Exit"), ("^O", "Save"), ("^W", "Where Is"),
-            ("^K", "Cut"), ("^U", "Paste"), ("^G", "Help")
+            ("^X", "Exit"), ("^O", "Save"), ("^W", "Search"),
+            ("^K", "Cut"), ("^U", "Paste"), ("^Z", "Undo"), ("^G", "Help"),
         ]
 
         help_text = "  "
@@ -174,7 +207,6 @@ class AtomoEditor:
             color = curses.color_pair(3) if self.message_type == "error" else \
                     curses.color_pair(4) if self.message_type == "success" else 0
 
-            # Clear the line
             self.safe_addstr(max_y - 3, 0, " " * (max_x - 1))
             self.stdscr.attron(color | curses.A_BOLD)
             self.safe_addstr(max_y - 3, 0, f" {self.message}")
@@ -186,13 +218,10 @@ class AtomoEditor:
 
         for screen_y in range(height):
             buffer_y = screen_y + self.offset_y
-
-            # Clear the line
             self.safe_addstr(screen_y + 1, 0, " " * width)
 
             if buffer_y < len(self.lines):
                 line = self.lines[buffer_y]
-                # Apply horizontal scrolling
                 visible_line = line[self.offset_x:self.offset_x + width]
                 self.safe_addstr(screen_y + 1, 0, visible_line)
 
@@ -205,7 +234,6 @@ class AtomoEditor:
         self.draw_status_bar()
         self.draw_help_bar()
 
-        # Position cursor
         screen_y = self.cursor_y - self.offset_y + 1
         screen_x = self.cursor_x - self.offset_x
         height, width = self.get_dimensions()
@@ -215,17 +243,19 @@ class AtomoEditor:
 
         self.stdscr.refresh()
 
+    # ------------------------------------------------------------------
+    # Scrolling and cursor movement
+    # ------------------------------------------------------------------
+
     def adjust_scroll(self):
         """Adjust scroll offsets to keep cursor visible"""
         height, width = self.get_dimensions()
 
-        # Vertical scrolling
         if self.cursor_y < self.offset_y:
             self.offset_y = self.cursor_y
         elif self.cursor_y >= self.offset_y + height:
             self.offset_y = self.cursor_y - height + 1
 
-        # Horizontal scrolling
         if self.cursor_x < self.offset_x:
             self.offset_x = self.cursor_x
         elif self.cursor_x >= self.offset_x + width:
@@ -233,36 +263,38 @@ class AtomoEditor:
 
     def move_cursor(self, dy: int, dx: int):
         """Move cursor with bounds checking"""
-        # Clear message when moving cursor
         self.message = ""
 
         self.cursor_y = max(0, min(len(self.lines) - 1, self.cursor_y + dy))
 
-        # Horizontal movement
         current_line = self.lines[self.cursor_y]
         self.cursor_x = max(0, min(len(current_line), self.cursor_x + dx))
 
         self.adjust_scroll()
 
+    # ------------------------------------------------------------------
+    # Editing operations
+    # ------------------------------------------------------------------
+
     def insert_char(self, char: str):
-        """Insert a character at cursor position"""
+        """Insert text at cursor position"""
+        self.push_undo()
         line = self.lines[self.cursor_y]
         self.lines[self.cursor_y] = line[:self.cursor_x] + char + line[self.cursor_x:]
-        self.cursor_x += 1
+        self.cursor_x += len(char)  # FIX: was += 1, which broke Tab (4 spaces → cursor off by 3)
         self.modified = True
         self.message = ""
         self.adjust_scroll()
 
     def delete_char(self):
         """Delete character at cursor (Delete key)"""
+        self.push_undo()
         line = self.lines[self.cursor_y]
 
         if self.cursor_x < len(line):
-            # Delete character at cursor
             self.lines[self.cursor_y] = line[:self.cursor_x] + line[self.cursor_x + 1:]
             self.modified = True
         elif self.cursor_y < len(self.lines) - 1:
-            # At end of line, merge with next line
             self.lines[self.cursor_y] = line + self.lines[self.cursor_y + 1]
             self.lines.pop(self.cursor_y + 1)
             self.modified = True
@@ -271,13 +303,13 @@ class AtomoEditor:
 
     def backspace(self):
         """Delete character before cursor (Backspace key)"""
+        self.push_undo()
         if self.cursor_x > 0:
             line = self.lines[self.cursor_y]
             self.lines[self.cursor_y] = line[:self.cursor_x - 1] + line[self.cursor_x:]
             self.cursor_x -= 1
             self.modified = True
         elif self.cursor_y > 0:
-            # At beginning of line, merge with previous line
             prev_line_len = len(self.lines[self.cursor_y - 1])
             self.lines[self.cursor_y - 1] += self.lines[self.cursor_y]
             self.lines.pop(self.cursor_y)
@@ -290,8 +322,8 @@ class AtomoEditor:
 
     def insert_newline(self):
         """Insert a new line at cursor position"""
+        self.push_undo()
         line = self.lines[self.cursor_y]
-        # Split the current line
         self.lines[self.cursor_y] = line[:self.cursor_x]
         self.lines.insert(self.cursor_y + 1, line[self.cursor_x:])
         self.cursor_y += 1
@@ -300,62 +332,55 @@ class AtomoEditor:
         self.message = ""
         self.adjust_scroll()
 
-    def prompt_save_filename(self) -> Optional[str]:
-        """Prompt user for filename to save"""
-        max_y, max_x = self.stdscr.getmaxyx()
-        prompt = f"File Name to Write: {self.filename if self.filename else ''}"
+    # ------------------------------------------------------------------
+    # Prompts
+    # ------------------------------------------------------------------
 
-        # Show prompt
+    def prompt_input(self, prompt_text: str, default: str = "") -> str:
+        """Render an inline prompt at the message line and return user input"""
+        max_y, max_x = self.stdscr.getmaxyx()
+
         self.stdscr.attron(curses.color_pair(1))
         self.safe_addstr(max_y - 3, 0, " " * (max_x - 1))
-        self.safe_addstr(max_y - 3, 0, prompt)
+        self.safe_addstr(max_y - 3, 0, prompt_text)
         self.stdscr.attroff(curses.color_pair(1))
 
-        # Get input
+        self.stdscr.refresh()
         curses.echo()
         try:
-            self.stdscr.move(max_y - 3, min(len(prompt), max_x - 2))
-            input_str = self.stdscr.getstr(max_y - 3, min(len(prompt), max_x - 2), max(1, max_x - len(prompt) - 1)).decode('utf-8')
-        except:
+            col = min(len(prompt_text), max_x - 2)
+            self.stdscr.move(max_y - 3, col)
+            raw = self.stdscr.getstr(max_y - 3, col, max(1, max_x - len(prompt_text) - 1))
+            input_str = raw.decode('utf-8')
+        except Exception:
             input_str = ""
         curses.noecho()
 
-        if input_str.strip():
-            return input_str.strip()
-        return self.filename
+        input_str = ''.join(c for c in input_str if c.isprintable()).strip()
+        return input_str if input_str else default
+
+    def prompt_save_filename(self) -> str:
+        """Prompt user for filename to save"""
+        prompt = f"File Name to Write: {self.filename if self.filename else ''}"
+        return self.prompt_input(prompt, default=self.filename or "")
 
     def prompt_search(self) -> Optional[str]:
         """Prompt user for search text"""
-        max_y, max_x = self.stdscr.getmaxyx()
-        prompt = "Search: "
+        result = self.prompt_input("Search: ")
+        return result if result else None
 
-        # Show prompt
-        self.stdscr.attron(curses.color_pair(1))
-        self.safe_addstr(max_y - 3, 0, " " * (max_x - 1))
-        self.safe_addstr(max_y - 3, 0, prompt)
-        self.stdscr.attroff(curses.color_pair(1))
-
-        # Get input
-        curses.echo()
-        try:
-            self.stdscr.move(max_y - 3, min(len(prompt), max_x - 2))
-            input_str = self.stdscr.getstr(max_y - 3, min(len(prompt), max_x - 2), max(1, max_x - len(prompt) - 1)).decode('utf-8')
-        except:
-            input_str = ""
-        curses.noecho()
-
-        return input_str.strip() if input_str.strip() else None
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
 
     def search(self, query: str):
-        """Search for text in buffer"""
+        """Search for text in buffer, wrapping around at EOF"""
         if not query:
             return
 
-        # Search from current position
         start_y = self.cursor_y
         start_x = self.cursor_x + 1
 
-        # Search current line first (from cursor position)
         pos = self.lines[start_y][start_x:].find(query)
         if pos != -1:
             self.cursor_x = start_x + pos
@@ -364,7 +389,6 @@ class AtomoEditor:
             self.adjust_scroll()
             return
 
-        # Search remaining lines
         for y in range(start_y + 1, len(self.lines)):
             pos = self.lines[y].find(query)
             if pos != -1:
@@ -375,7 +399,6 @@ class AtomoEditor:
                 self.adjust_scroll()
                 return
 
-        # Wrap around and search from beginning
         for y in range(0, start_y):
             pos = self.lines[y].find(query)
             if pos != -1:
@@ -389,6 +412,10 @@ class AtomoEditor:
         self.message = f"'{query}' not found"
         self.message_type = "error"
 
+    # ------------------------------------------------------------------
+    # Help and exit
+    # ------------------------------------------------------------------
+
     def show_help(self):
         """Show help screen"""
         max_y, max_x = self.stdscr.getmaxyx()
@@ -401,20 +428,22 @@ class AtomoEditor:
             "  Ctrl+W  Search (Where Is)",
             "  Ctrl+K  Cut line",
             "  Ctrl+U  Paste line",
+            "  Ctrl+Z  Undo (up to 200 steps)",
             "  Ctrl+G  Show this help",
             "",
             "Navigation:",
-            "  Arrow Keys  Move cursor",
-            "  Home/Ctrl+A Beginning of line",
-            "  End/Ctrl+E  End of line",
+            "  Arrow Keys   Move cursor",
+            "  Home/Ctrl+A  Beginning of line",
+            "  End/Ctrl+E   End of line",
             "  Page Up/Down Scroll page",
             "",
             "Editing:",
             "  Enter      Insert new line",
             "  Backspace  Delete character before cursor",
             "  Delete     Delete character at cursor",
+            "  Tab        Insert 4 spaces",
             "",
-            "Press any key to continue..."
+            "Press any key to continue...",
         ]
 
         self.stdscr.clear()
@@ -426,7 +455,7 @@ class AtomoEditor:
         self.stdscr.getch()
 
     def confirm_exit(self) -> bool:
-        """Ask user to confirm exit if modified"""
+        """Ask user to confirm exit if buffer is modified"""
         if not self.modified:
             return True
 
@@ -442,47 +471,43 @@ class AtomoEditor:
         while True:
             key = self.stdscr.getch()
             if key in [ord('y'), ord('Y')]:
-                # Save and exit
                 filename = self.prompt_save_filename()
                 if filename and self.save_file(filename):
                     return True
                 return False
-            elif key in [ord('n'), ord('N')]:
-                # Exit without saving
+            elif key in [ord('n'), ord('N'), CTRL_X]:  # Ctrl+X due volte = esci senza salvare
                 return True
-            elif key in [ord('c'), ord('C'), 27]:  # 27 is ESC
-                # Cancel
+            elif key in [ord('c'), ord('C'), 27]:  # 27 = ESC
                 return False
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     def run(self):
         """Main editor loop"""
-        cut_buffer = ""
-
         while True:
             self.draw()
             key = self.stdscr.getch()
 
-            # Handle Ctrl+X (Exit)
-            if key == 24:  # Ctrl+X
+            if key == CTRL_X:
                 if self.confirm_exit():
                     break
 
-            # Handle Ctrl+O (Save)
-            elif key == 15:  # Ctrl+O
+            elif key == CTRL_O:
                 filename = self.prompt_save_filename()
                 if filename:
                     self.save_file(filename)
 
-            # Handle Ctrl+W (Search)
-            elif key == 23:  # Ctrl+W
+            elif key == CTRL_W:
                 query = self.prompt_search()
                 if query:
                     self.search(query)
 
-            # Handle Ctrl+K (Cut line)
-            elif key == 11:  # Ctrl+K
+            elif key == CTRL_K:
                 if self.lines:
-                    cut_buffer = self.lines[self.cursor_y]
+                    self.push_undo()
+                    self.cut_buffer = self.lines[self.cursor_y]
                     self.lines.pop(self.cursor_y)
                     if not self.lines:
                         self.lines = [""]
@@ -493,29 +518,28 @@ class AtomoEditor:
                     self.message = "Cut line"
                     self.message_type = "info"
 
-            # Handle Ctrl+U (Paste)
-            elif key == 21:  # Ctrl+U
-                if cut_buffer:
-                    self.lines.insert(self.cursor_y, cut_buffer)
+            elif key == CTRL_U:
+                if self.cut_buffer:
+                    self.push_undo()
+                    self.lines.insert(self.cursor_y, self.cut_buffer)
                     self.modified = True
                     self.message = "Pasted line"
                     self.message_type = "info"
 
-            # Handle Ctrl+G (Help)
-            elif key == 7:  # Ctrl+G
+            elif key == CTRL_Z:
+                self.undo()
+
+            elif key == CTRL_G:
                 self.show_help()
 
-            # Handle Ctrl+A (Home)
-            elif key == 1:  # Ctrl+A
+            elif key == CTRL_A:
                 self.cursor_x = 0
                 self.adjust_scroll()
 
-            # Handle Ctrl+E (End)
-            elif key == 5:  # Ctrl+E
+            elif key == CTRL_E:
                 self.cursor_x = len(self.lines[self.cursor_y])
                 self.adjust_scroll()
 
-            # Navigation keys
             elif key == curses.KEY_UP:
                 self.move_cursor(-1, 0)
             elif key == curses.KEY_DOWN:
@@ -540,30 +564,25 @@ class AtomoEditor:
             elif key == curses.KEY_END:
                 self.cursor_x = len(self.lines[self.cursor_y])
                 self.adjust_scroll()
-            elif key == curses.KEY_PPAGE:  # Page Up
+            elif key == curses.KEY_PPAGE:
                 height, _ = self.get_dimensions()
                 self.move_cursor(-height, 0)
-            elif key == curses.KEY_NPAGE:  # Page Down
+            elif key == curses.KEY_NPAGE:
                 height, _ = self.get_dimensions()
                 self.move_cursor(height, 0)
 
-            # Handle Enter
             elif key in [curses.KEY_ENTER, 10, 13]:
                 self.insert_newline()
 
-            # Handle Backspace
             elif key in [curses.KEY_BACKSPACE, 127, 8]:
                 self.backspace()
 
-            # Handle Delete
             elif key == curses.KEY_DC:
                 self.delete_char()
 
-            # Handle Tab
-            elif key == 9:
-                self.insert_char('    ')  # Insert 4 spaces
+            elif key == 9:  # Tab
+                self.insert_char('    ')
 
-            # Handle printable characters
             elif 32 <= key <= 126:
                 self.insert_char(chr(key))
 
